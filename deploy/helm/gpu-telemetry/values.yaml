@@ -1,0 +1,30 @@
+# Project scope: one instance per service, plaintext traffic, no authentication.
+images:
+  prefix: gpu-telemetry
+  tag: dev
+  pullPolicy: IfNotPresent
+streamer:
+  replicas: 1
+  interval: 10ms
+  loop: true
+collector:
+  replicas: 1
+  slots: 1
+queue:
+  replicas: 1
+  maxMessages: 10000
+  maxBytes: 67108864
+  maxMessageBytes: 65536
+  maxSlots: 128
+  maxSubscribers: 10
+  ackTimeout: 30s
+database:
+  # Empty uses the in-chart database. Supply a URL when postgresEnabled=false.
+  url: ""
+  postgresEnabled: true
+  image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
+  storage: 5Gi
+  storageClass: ''
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { cpu: '1', memory: 256Mi }

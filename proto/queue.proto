@@ -1,0 +1,46 @@
+syntax = "proto3";
+package telemetry.queue.v1;
+option go_package = "gpu-telemetry-pipeline/api/queue/v1;queuev1";
+
+// Queue implements a bounded work queue, not fan-out messaging.
+service Queue {
+  rpc Produce(stream Envelope) returns (stream ProduceResult);
+  rpc Subscribe(stream ConsumerFrame) returns (stream Delivery);
+}
+message Key { string streamer_session = 1; int64 sequence = 2; }
+message Telemetry {
+  string timestamp = 1;
+  string metric_name = 2;
+  string gpu_id = 3;
+  string device = 4;
+  string uuid = 5;
+  string model_name = 6;
+  string hostname = 7;
+  string container = 8;
+  string pod = 9;
+  string namespace = 10;
+  string value = 11;
+  string labels_raw = 12;
+}
+message Envelope { Key key = 1; Telemetry telemetry = 2; }
+enum ProduceStatus {
+  PRODUCE_STATUS_UNSPECIFIED = 0;
+  PRODUCE_STATUS_ACCEPTED = 1;
+  PRODUCE_STATUS_DUPLICATE = 2;
+  PRODUCE_STATUS_FULL = 3;
+  PRODUCE_STATUS_INVALID = 4;
+  PRODUCE_STATUS_DRAINING = 5;
+}
+message ProduceResult { Key key = 1; ProduceStatus status = 2; string reason = 3; }
+message Subscription { int32 slots = 1; }
+enum Disposition {
+  DISPOSITION_UNSPECIFIED = 0;
+  DISPOSITION_ACK_PERSISTED = 1;
+  DISPOSITION_RETRY = 2;
+  DISPOSITION_REJECT = 3;
+}
+message Completion { Key key = 1; int64 delivery_tag = 2; Disposition disposition = 3; string reason = 4; }
+message ConsumerFrame {
+  oneof body { Subscription subscribe = 1; Completion completion = 2; }
+}
+message Delivery { Envelope envelope = 1; int64 delivery_tag = 2; }

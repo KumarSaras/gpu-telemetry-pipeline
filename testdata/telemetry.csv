@@ -1,0 +1,3 @@
+timestamp,metric_name,gpu_id,device,uuid,modelName,Hostname,container,pod,namespace,value,labels_raw
+2000-01-01T00:00:00Z,GPU_UTIL,0,nvidia0,GPU-test-0,Test GPU,host-0,,,,12.3400,"kind=""test"",label=""a,b"""
+2000-01-01T00:00:00Z,GPU_UTIL,0,nvidia0,GPU-test-1,Test GPU,host-1,,,,12.3400,"kind=""test"",label=""a,b"""
