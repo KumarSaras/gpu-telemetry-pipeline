@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestConcurrentMetricsAndReadiness(t *testing.T) {
@@ -91,5 +92,23 @@ func TestWrapCountsPanicsAndPreservesAbort(t *testing.T) {
 				t.Fatal(w.Body.String())
 			}
 		}
+	}
+}
+
+func TestReadySuccessUsesBoundedAndReleasedOperationContext(t *testing.T) {
+	var operation context.Context
+	mux := http.NewServeMux()
+	Health(mux, func(ctx context.Context) error {
+		operation = ctx
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > time.Second || time.Until(deadline) <= 0 {
+			t.Fatal("unbounded readiness check")
+		}
+		return nil
+	})
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/readyz", nil))
+	if w.Code != 200 || w.Body.String() != "ready\n" || operation.Err() != context.Canceled {
+		t.Fatal(w.Code, w.Body.String(), operation.Err())
 	}
 }

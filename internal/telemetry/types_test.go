@@ -109,3 +109,18 @@ func TestParseBoundsOptionalFieldsAndErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestInvalidHexSessionAndRequiredTelemetryFields(t *testing.T) {
+	if err := (Key{Session: "gggggggggggggggggggggggggggggggg", Sequence: 1}).Validate(); err == nil {
+		t.Fatal("invalid session hex accepted")
+	}
+	for _, raw := range []Raw{
+		{Timestamp: "0000-01-01T00:00:00Z", UUID: "GPU-a", MetricName: "util", Value: "1"},
+		{Timestamp: "2026-11-09T00:00:00Z", MetricName: "util", Value: "1"},
+		{Timestamp: "2026-11-09T00:00:00Z", UUID: "GPU-a", Value: "1"},
+	} {
+		if _, err := Parse(raw); err == nil {
+			t.Fatal("invalid required field accepted", raw)
+		}
+	}
+}

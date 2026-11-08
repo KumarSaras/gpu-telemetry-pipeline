@@ -6,13 +6,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"gpu-telemetry-pipeline/internal/telemetry"
 	"strings"
 	"time"
 )
 
-type Repository struct{ Pool *pgxpool.Pool }
+// Pool is the database boundary used by the repository and its callers.
+// *pgxpool.Pool implements it; tests can exercise failures without a database.
+type Pool interface {
+	Begin(context.Context) (pgx.Tx, error)
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Close()
+}
+
+type Repository struct{ Pool Pool }
 
 func Open(ctx context.Context, url string, max int32) (*Repository, error) {
 	cfg, err := pgxpool.ParseConfig(url)

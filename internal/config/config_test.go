@@ -135,3 +135,15 @@ func TestTimeoutRelationshipsAndBrokerSlotCeiling(t *testing.T) {
 		t.Fatal(q, err)
 	}
 }
+
+func TestDurationBounds(t *testing.T) {
+	cleanEnvironment(t)
+	for _, value := range []string{"0s", "-1s", "24h1s"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("ACK_TIMEOUT", value)
+			if _, err := LoadQueue(); err == nil {
+				t.Fatal("out-of-bounds duration accepted")
+			}
+		})
+	}
+}

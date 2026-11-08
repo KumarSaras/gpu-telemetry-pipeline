@@ -4,7 +4,7 @@ package migrations
 import (
 	"context"
 	_ "embed"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 	"time"
 )
 
@@ -14,7 +14,12 @@ var initial string
 //go:embed 002_drop_payload_hash.sql
 var dropPayloadHash string
 
-func Apply(ctx context.Context, pool *pgxpool.Pool) error {
+// Beginner is the transaction boundary supplied by *pgxpool.Pool.
+type Beginner interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+func Apply(ctx context.Context, pool Beginner) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err

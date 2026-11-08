@@ -328,3 +328,172 @@ func TestRunLogsOriginalReceiveFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type subscribeFailureClient struct {
+	pb.QueueClient
+	failure error
+}
+
+func (c *subscribeFailureClient) Subscribe(context.Context, ...grpc.CallOption) (pb.Queue_SubscribeClient, error) {
+	return nil, c.failure
+}
+
+func TestSubscriptionSetupFailuresNeverLeaveReadinessOrStreamActive(t *testing.T) {
+	failure := errors.New("stream setup failed")
+	c := &Collector{Client: &subscribeFailureClient{failure: failure}, Slots: 1, ProcessTimeout: time.Second, SendTimeout: time.Second}
+	if err := c.session(context.Background()); !errors.Is(err, failure) {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"subscribe send", "header read", "missing budget", "malformed budget", "late header", "shutdown after header"} {
+		t.Run(mode, func(t *testing.T) {
+			serviceCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var streamCtx context.Context
+			client := &scriptedClient{open: func(ctx context.Context) *scriptedStream {
+				streamCtx = ctx
+				return &scriptedStream{ctx: ctx, send: func(*pb.ConsumerFrame) error {
+					if mode == "subscribe send" {
+						return failure
+					}
+					return nil
+				}, header: func() (metadata.MD, error) {
+					switch mode {
+					case "header read":
+						return nil, failure
+					case "missing budget":
+						return nil, nil
+					case "malformed budget":
+						return metadata.Pairs("ack-timeout", "bad"), nil
+					case "late header":
+						<-ctx.Done()
+					case "shutdown after header":
+						cancel()
+					}
+					return metadata.Pairs("ack-timeout", "30s"), nil
+				}}
+			}}
+			c := &Collector{Client: client, Slots: 1, ProcessTimeout: time.Second, SendTimeout: 20 * time.Millisecond}
+			err := c.session(serviceCtx)
+			if err == nil || c.Ready.Load() || streamCtx.Err() == nil {
+				t.Fatal("failed setup retained stream or readiness", err)
+			}
+			switch mode {
+			case "subscribe send", "header read":
+				if !errors.Is(err, failure) {
+					t.Fatal(err)
+				}
+			case "malformed budget":
+				if !errors.Is(err, ErrTimeoutConfiguration) {
+					t.Fatal(err)
+				}
+			case "late header":
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatal(err)
+				}
+			case "shutdown after header":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+func TestRunRejectsInvalidConfigurationOrIncompatibleBudget(t *testing.T) {
+	c := &Collector{Slots: 0, ProcessTimeout: time.Second}
+	if err := c.Run(context.Background()); err == nil || c.SendTimeout != 5*time.Second {
+		t.Fatal(err, c.SendTimeout)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c = &Collector{Slots: 1, ProcessTimeout: time.Second}
+	if err := c.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	calls := 0
+	c = &Collector{Client: &scriptedClient{open: func(ctx context.Context) *scriptedStream {
+		calls++
+		return &scriptedStream{ctx: ctx, header: func() (metadata.MD, error) { return metadata.Pairs("ack-timeout", "2s"), nil }}
+	}}, Slots: 1, ProcessTimeout: time.Second, SendTimeout: time.Second}
+	if err := c.Run(context.Background()); !errors.Is(err, ErrTimeoutConfiguration) || calls != 1 {
+		t.Fatal("configuration failure retried", err, calls)
+	}
+}
+func TestInvalidDeliveryAndPersistenceOrCompletionFailureEndSession(t *testing.T) {
+	failure := errors.New("persistence unavailable")
+	for _, mode := range []string{"invalid envelope", "invalid tag", "retry", "completion send"} {
+		t.Run(mode, func(t *testing.T) {
+			var disposition pb.Disposition
+			client := &scriptedClient{open: func(ctx context.Context) *scriptedStream {
+				first := true
+				return &scriptedStream{ctx: ctx, receive: func() (*pb.Delivery, error) {
+					if first {
+						first = false
+						d := wireDelivery(1)
+						if mode == "invalid envelope" {
+							d.Envelope = nil
+						}
+						if mode == "invalid tag" {
+							d.DeliveryTag = 0
+						}
+						return d, nil
+					}
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}, send: func(frame *pb.ConsumerFrame) error {
+					if completion := frame.GetCompletion(); completion != nil {
+						disposition = completion.Disposition
+						if mode == "completion send" {
+							return failure
+						}
+					}
+					return nil
+				}}
+			}}
+			store := storeFunc(func(context.Context, telemetry.Key, telemetry.Record) (bool, error) {
+				if mode == "retry" {
+					return false, failure
+				}
+				return true, nil
+			})
+			c := &Collector{Client: client, Store: store, Slots: 1, ProcessTimeout: time.Second, SendTimeout: time.Second, Log: testsupport.Logger()}
+			err := c.session(context.Background())
+			if err == nil || c.Ready.Load() {
+				t.Fatal(err)
+			}
+			if mode == "retry" && (disposition != pb.Disposition_DISPOSITION_RETRY || !strings.Contains(err.Error(), "transient persistence failure")) {
+				t.Fatal(disposition, err)
+			}
+			if mode == "completion send" && !errors.Is(err, failure) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+func TestReceiveFailureWhileCompletionIsPendingPreservesItsCause(t *testing.T) {
+	failure := status.Error(codes.Unavailable, "stream lost during acknowledgement")
+	sending, sendExited := make(chan struct{}), make(chan struct{})
+	client := &scriptedClient{open: func(ctx context.Context) *scriptedStream {
+		first := true
+		return &scriptedStream{ctx: ctx, receive: func() (*pb.Delivery, error) {
+			if first {
+				first = false
+				return wireDelivery(1), nil
+			}
+			<-sending
+			return nil, failure
+		}, send: func(frame *pb.ConsumerFrame) error {
+			if frame.GetSubscribe() != nil {
+				return nil
+			}
+			close(sending)
+			<-ctx.Done()
+			close(sendExited)
+			return ctx.Err()
+		}}
+	}}
+	c := &Collector{Client: client, Store: storeFunc(func(context.Context, telemetry.Key, telemetry.Record) (bool, error) { return true, nil }), Slots: 1, ProcessTimeout: time.Second, SendTimeout: time.Second, Log: testsupport.Logger()}
+	if err := c.session(context.Background()); !errors.Is(err, failure) {
+		t.Fatal(err)
+	}
+	waitSignal(t, sendExited)
+}

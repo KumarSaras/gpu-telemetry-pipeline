@@ -25,6 +25,8 @@ coverage:
 	go test -coverpkg=$(COVER_PKGS) -coverprofile=coverage.out -covermode=atomic ./internal/... ./migrations/...
 	go tool cover -func=coverage.out
 	go tool cover -html=coverage.out -o coverage.html
+	python3 -B tests/test_coverage_gate.py
+	python3 tools/check_coverage.py coverage.out
 openapi:
 	@mkdir -p api
 	@go run ./cmd/openapi > api/openapi.json.tmp && mv api/openapi.json.tmp api/openapi.json

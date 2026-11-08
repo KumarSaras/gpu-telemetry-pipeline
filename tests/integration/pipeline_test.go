@@ -280,3 +280,57 @@ func TestFullFixtureThroughPipelineAndPublicAPI(t *testing.T) {
 		t.Fatal("collector did not stop")
 	}
 }
+
+func TestFailedMigrationRollsBackMetadataAndCanBeRetried(t *testing.T) {
+	pool := databasePool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := pool.Exec(ctx, "CREATE TABLE telemetry(existing text); INSERT INTO telemetry VALUES ('keep')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrations.Apply(ctx, pool); err == nil {
+		t.Fatal("schema conflict did not fail")
+	}
+	var present bool
+	if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='schema_migrations')").Scan(&present); err != nil || present {
+		t.Fatal("failed migration committed version metadata", present, err)
+	}
+	var value string
+	if err := pool.QueryRow(ctx, "SELECT existing FROM telemetry").Scan(&value); err != nil || value != "keep" {
+		t.Fatal("failed migration changed existing data", value, err)
+	}
+	if _, err := pool.Exec(ctx, "DROP TABLE telemetry"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrations.Apply(ctx, pool); err != nil {
+		t.Fatal("migration could not retry", err)
+	}
+	var versions int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 2 {
+		t.Fatal(versions, err)
+	}
+}
+
+func TestConcurrentMigrationsSerializeAndApplyEachVersionOnce(t *testing.T) {
+	pool := databasePool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var workers sync.WaitGroup
+	for range 4 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			if err := migrations.Apply(ctx, pool); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	workers.Wait()
+	var versions, legacyColumns int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 2 {
+		t.Fatal(versions, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='telemetry' AND column_name='payload_hash'").Scan(&legacyColumns); err != nil || legacyColumns != 0 {
+		t.Fatal(legacyColumns, err)
+	}
+}
