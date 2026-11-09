@@ -66,6 +66,13 @@ Expect four ready application pods, one ready PostgreSQL pod, a bound database v
 
 The streamer continuously replays the sample. One complete pass produces 2,470 records for 247 unique GPU UUIDs; the record count grows on subsequent passes.
 
+Check ingestion directly in PostgreSQL (output: total rows, distinct GPU UUIDs):
+
+```sh
+kubectl --namespace gpu-telemetry exec statefulset/gpu-telemetry-postgres -- \
+  psql -U postgres -d telemetry -Atc 'SELECT count(*), count(DISTINCT uuid) FROM telemetry;'
+```
+
 ## Port forwarding
 
 Forward the gateway to access the API. Keep this terminal running:
@@ -104,6 +111,15 @@ Once the GPU list is nonempty, select a returned UUID and query its records:
 ```sh
 GPU_UUID="$(curl --fail --silent http://localhost:8080/api/v1/gpus | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])')"
 curl --fail "http://localhost:8080/api/v1/gpus/${GPU_UUID}/telemetry"
+```
+
+Query a record with the time filter:
+```sh
+GPU_UUID="$(curl --fail --silent http://localhost:8080/api/v1/gpus | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])')"
+curl --fail-with-body --get \
+  "http://localhost:8080/api/v1/gpus/${GPU_UUID}/telemetry" \
+  --data-urlencode 'start_time=2026-11-09T10:00:00Z' \
+  --data-urlencode 'end_time=2026-11-09T11:00:00Z'
 ```
 
 | API | Purpose |
@@ -173,7 +189,7 @@ Each service reads only the settings it uses.
 | `QUEUE_URL` | Streamer, collector | Host: `localhost:9090`; Helm: `gpu-telemetry-queue:9090` | Automatically generated from the release name. |
 | `DATABASE_URL` | Collector, gateway, migration Job | Required for host runs; generated for the bundled database | `database.url` overrides the generated connection URL. |
 | `DB_MAX_CONNECTIONS` | Collector, gateway | `10` | —; pool size per service process. |
-| `REQUEST_TIMEOUT` | Streamer, collector, gateway | `5s` | —; producer acceptance and collector handshake/completion budget; also collector/gateway initial DB connection budget. |
+| `REQUEST_TIMEOUT` | Streamer, collector, gateway | `5s` | —; producer acceptance, collector storage check/handshake/completion, and collector/gateway initial DB connection budget. |
 | `SHUTDOWN_TIMEOUT` | All four applications | `20s` | —; bounded drain/shutdown. |
 | `HTTP_ADDR` | All four applications | Queue `:8081`; streamer `:8083`; collector `:8082`; gateway `:8080` | —; application HTTP listener. |
 | `MAX_MESSAGE_BYTES` | Queue, streamer, collector | `65536` (64 KiB) | `queue.maxMessageBytes`; Helm sets the same limit on the broker and both clients. |
@@ -189,7 +205,7 @@ The migration Job reads only `DATABASE_URL`; it uses one connection and a fixed 
 | `database.storage` | `5Gi` | PostgreSQL persistent volume claim size. |
 | `database.storageClass` | Empty | Use the cluster's default StorageClass. |
 | `database.image` | Pinned `postgres:18-alpine` | Database image; full digest is in values.yaml. |
-| `streamer.replicas`, `collector.replicas` | `1` each | Independent instance counts; chart accepts 1–10. Start with one. |
+| `streamer.replicas`, `collector.replicas` | `1` each | Independent instance counts; chart accepts 0–10. Zero stops that application. |
 | `queue.replicas` | `1` | Fixed at one for this in-memory queue design. |
 | `images.prefix`, `images.tag` | `gpu-telemetry`, `dev` | Image names used by the four applications and migration Job. |
 | `images.pullPolicy` | `IfNotPresent` | Application and migration image pull policy. |
@@ -206,6 +222,17 @@ helm upgrade --install gpu-telemetry deploy/helm/gpu-telemetry \
 ```
 
 The affected workloads restart to pick up their new settings. See the [configuration loaders](internal/config/config.go) for validation bounds and the [design](docs/design.md) for delivery/deadline details.
+
+Pause both workers while keeping the queue and stored data:
+
+```sh
+helm upgrade gpu-telemetry deploy/helm/gpu-telemetry \
+  --namespace gpu-telemetry --reuse-values \
+  --set streamer.replicas=0 --set collector.replicas=0 \
+  --wait --wait-for-jobs --timeout 5m
+```
+
+Set either count back to `1` to resume it; a restarted streamer begins a new CSV replay session. To drain before pausing collectors, stop streamers first and wait for `gpu_telemetry_queue_messages` to reach zero. With only collectors stopped, the queue eventually fills and backpressures streamers.
 
 ## Health and metrics
 
@@ -226,7 +253,19 @@ curl --fail http://localhost:8081/readyz
 curl --fail http://localhost:8081/metrics
 ```
 
+Fetch queue metrics every second while the port-forward is running; stop with **Ctrl+C**. Change the port to inspect another service.
+
+```sh
+while true; do
+  date
+  curl -fsS http://localhost:8081/metrics
+  sleep 1
+done
+```
+
 `/livez` checks that the HTTP process responds. `/readyz` checks application readiness and returns HTTP 503 when unavailable. Collector readiness checks its subscription and database; gateway readiness checks the database. Streamer readiness means replay is running, so use acceptance/persistence counters to check data progress.
+
+Collectors wait for the telemetry table before subscribing or reconnecting. While waiting, liveness stays healthy and readiness stays false; the queue retains messages until collectors can consume them.
 
 ### Available metrics
 
@@ -282,7 +321,6 @@ kubectl -n gpu-telemetry get events --sort-by=.lastTimestamp
 | Empty GPU list or telemetry result | Allow ingestion to start; select a listed UUID and bounds matching the returned timestamps. |
 | Backlog, write errors, or repeated reconnects | Check collector logs, persistence counters, and PostgreSQL pod health. A full queue is backpressure, not a reason to restart it. |
 | Commands target the wrong cluster | Export the project kubeconfig again and check `kubectl config current-context`; expect `kind-gpu-telemetry`. |
-| An upgrade reports obsolete values | Follow the [existing-release upgrade steps](README.md#6-change-collector-slots-or-update-application-code). |
 
 ## Tests and Make commands
 
@@ -305,12 +343,33 @@ make coverage
 | `make helm-template` | Render Kubernetes manifests to `.cache/helm-rendered.yaml` without installing them. |
 | `make helm-check` | Check chart defaults, supported configuration, and invalid-value rejection. |
 | `make smoke` | Load already-built images into a new temporary Kind cluster, install Helm, verify the pipeline/API/metrics, and delete that test cluster and data. |
-| `make integration` | Run real PostgreSQL tests. Requires `TEST_DATABASE_URL` pointing to an existing disposable database named `gpu_telemetry_test*`. |
+| `make integration` | Run real PostgreSQL tests. Requires `TEST_DATABASE_URL` env variable pointing to an existing disposable database named `gpu_telemetry_test*`. |
 | `make openapi` | Regenerate `api/openapi.json` without a database. |
 | `make generate-proto` | Regenerate gRPC code; requires protoc and Go generator plugins. Generated files are already included. |
 | `make migrate` | Apply schema migrations using `DATABASE_URL`. Helm already runs migrations during installation/upgrades. |
 
 For other local image tags, use `make images IMAGE_TAG=dev2`; pass the same tag to image loading, Helm, and `make smoke`.
+
+For `make integration`, create a new disposable database instance and run the test and cleanup command using:
+```sh
+docker run --rm -d \
+  --name gpu-telemetry-integration-db \
+  -e POSTGRES_DB=gpu_telemetry_test \
+  -e POSTGRES_PASSWORD=test-only-password \
+  -p 127.0.0.1:55432:5432 \
+  postgres:18-alpine
+
+until docker exec gpu-telemetry-integration-db \
+  pg_isready -U postgres -d gpu_telemetry_test
+do
+  sleep 1
+done
+
+TEST_DATABASE_URL='postgres://postgres:test-only-password@localhost:55432/gpu_telemetry_test?sslmode=disable' \
+  make integration
+
+docker stop gpu-telemetry-integration-db
+```
 
 ## Cleanup
 

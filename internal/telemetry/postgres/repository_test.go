@@ -15,8 +15,9 @@ import (
 )
 
 type fakePool struct {
-	exec  func(context.Context, string, ...any) (pgconn.CommandTag, error)
-	query func(context.Context, string, ...any) (pgx.Rows, error)
+	exec     func(context.Context, string, ...any) (pgconn.CommandTag, error)
+	query    func(context.Context, string, ...any) (pgx.Rows, error)
+	queryRow func(context.Context, string, ...any) pgx.Row
 }
 
 func (*fakePool) Begin(context.Context) (pgx.Tx, error) {
@@ -29,8 +30,11 @@ func (p *fakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 func (p *fakePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	return p.query(ctx, sql, args...)
 }
-func (*fakePool) QueryRow(context.Context, string, ...any) pgx.Row {
-	panic("unexpected follow-up row lookup")
+func (p *fakePool) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if p.queryRow == nil {
+		panic("unexpected follow-up row lookup")
+	}
+	return p.queryRow(ctx, sql, args...)
 }
 func (*fakePool) Close() {}
 
@@ -226,26 +230,52 @@ func TestQueryErrorsAndCursorRecordMetadataPrecision(t *testing.T) {
 	}
 }
 func TestReadyChecksTableAndReleasesRows(t *testing.T) {
-	failure := errors.New("missing schema")
-	for _, fail := range []bool{false, true} {
-		rows := &fakeRows{}
-		repo := &Repository{Pool: &fakePool{query: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
-			if sql != "SELECT uuid FROM telemetry LIMIT 0" {
-				t.Fatal(sql)
+	failure := errors.New("database read failed")
+	for _, test := range []struct {
+		name                             string
+		exists                           bool
+		lookupError, readError, rowError error
+		wantError                        error
+	}{
+		{name: "table absent", wantError: ErrTableNotReady},
+		{name: "lookup failure", lookupError: failure, wantError: failure},
+		{name: "readable table", exists: true},
+		{name: "read denied", exists: true, readError: failure, wantError: failure},
+		{name: "row failure", exists: true, rowError: failure, wantError: failure},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			rows := &fakeRows{iterationError: test.rowError}
+			reads := 0
+			repo := &Repository{Pool: &fakePool{
+				queryRow: func(got context.Context, sql string, args ...any) pgx.Row {
+					if got != ctx || sql != "SELECT to_regclass('telemetry') IS NOT NULL" || len(args) != 0 {
+						t.Fatal("unexpected table lookup", sql, args)
+					}
+					return &fakeRows{values: [][]any{{test.exists}}, index: 1, scanError: test.lookupError}
+				},
+				query: func(got context.Context, sql string, _ ...any) (pgx.Rows, error) {
+					reads++
+					if got != ctx || sql != "SELECT uuid FROM telemetry LIMIT 0" || !test.exists || test.lookupError != nil {
+						t.Fatal("queried unavailable table", sql)
+					}
+					if test.readError != nil {
+						return nil, test.readError
+					}
+					return rows, nil
+				},
+			}}
+			if err := repo.Ready(ctx); !errors.Is(err, test.wantError) {
+				t.Fatal(err, test.wantError)
 			}
-			if fail {
-				return nil, failure
+			if test.exists && test.lookupError == nil {
+				if reads != 1 || (test.readError == nil && !rows.closed) {
+					t.Fatal("read check missing or rows leaked", reads, rows.closed)
+				}
+			} else if reads != 0 {
+				t.Fatal("queried table before it exists")
 			}
-			return rows, nil
-		}}}
-		err := repo.Ready(context.Background())
-		if fail {
-			if !errors.Is(err, failure) {
-				t.Fatal(err)
-			}
-		} else if err != nil || !rows.closed {
-			t.Fatal(err, rows.closed)
-		}
+		})
 	}
 }
 func TestOpenRejectsBadConfigurationAndUnavailableDatabase(t *testing.T) {

@@ -68,7 +68,7 @@
       "properties": {
         "replicas": {
           "type": "integer",
-          "minimum": 1,
+          "minimum": 0,
           "maximum": 10
         },
         "slots": {
@@ -83,7 +83,7 @@
       "properties": {
         "replicas": {
           "type": "integer",
-          "minimum": 1,
+          "minimum": 0,
           "maximum": 10
         },
         "loop": {

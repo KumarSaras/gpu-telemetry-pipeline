@@ -91,6 +91,15 @@ def main():
                                'psql', '-U', 'postgres', '-d', 'telemetry',
                                '-Atc', 'SELECT count(*) FROM telemetry').strip())
 
+        def upgrade(*settings):
+            args = ['upgrade', release, str(ROOT / 'deploy/helm/gpu-telemetry'),
+                    '--kubeconfig', str(kubeconfig), '--namespace', namespace,
+                    '--reuse-values']
+            for setting in settings:
+                args.extend(('--set', setting))
+            run('helm', *args, '--wait', '--wait-for-jobs', '--timeout', '5m',
+                timeout=330)
+
         try:
             # Fail before creating resources if the caller has not built images.
             run('docker', 'image', 'inspect', *images)
@@ -114,6 +123,9 @@ def main():
             assert not json.loads(kubectl('get', 'networkpolicies', '-o', 'json'))['items']
             assert all(d['spec']['replicas'] == 1 and
                        d['status'].get('readyReplicas') == 1 for d in deployments)
+            queue_selector = f'app.kubernetes.io/instance={release},app.kubernetes.io/component=queue'
+            queue_uid = kubectl('get', 'pods', '-l', queue_selector,
+                                '-o', 'jsonpath={.items[0].metadata.uid}')
             collector = next(d for d in deployments if d['metadata']['name'] == release + '-collector')
             variables = collector['spec']['template']['spec']['containers'][0]['env']
             assert next(v['value'] for v in variables if v['name'] == 'COLLECTOR_SLOTS') == '1'
@@ -138,7 +150,7 @@ def main():
             streamer_pods = kubectl('get', 'pods', '-l',
                                     f'app.kubernetes.io/instance={release},app.kubernetes.io/component=streamer',
                                     '-o', 'name').splitlines()
-            kubectl('scale', f'deployment/{release}-streamer', '--replicas=0')
+            upgrade('streamer.replicas=0')
             if streamer_pods:
                 kubectl('wait', '--for=delete', *streamer_pods,
                         '--timeout=60s', timeout=70)
@@ -178,9 +190,34 @@ def main():
             bounded = json.loads(text(gateway, path + '?' + query))
             assert bounded and all(row['timestamp'] == timestamp for row in bounded)
             assert len(json.loads(text(gateway, '/openapi.json'))['paths']) == 2
+            collector_pods = kubectl('get', 'pods', '-l',
+                                     f'app.kubernetes.io/instance={release},app.kubernetes.io/component=collector',
+                                     '-o', 'name').splitlines()
+            upgrade('collector.replicas=0')
+            if collector_pods:
+                kubectl('wait', '--for=delete', *collector_pods,
+                        '--timeout=60s', timeout=70)
+            paused = json.loads(kubectl('get', 'deployments', '-o', 'json'))['items']
+            assert all(d['spec']['replicas'] == 0 for d in paused
+                       if d['metadata']['name'] in (release + '-streamer', release + '-collector'))
+            deadline = time.monotonic() + 30
+            while metrics(endpoints['queue'])['gpu_telemetry_subscribers'] != 0:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Collector subscription remained after scale-to-zero')
+                time.sleep(0.2)
+            assert row_count() == count
+            upgrade('collector.replicas=1', 'streamer.replicas=1')
+            deadline = time.monotonic() + 60
+            while row_count() <= count:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Ingestion did not resume after Helm scale-up')
+                time.sleep(0.2)
+            assert kubectl('get', 'pods', '-l', queue_selector,
+                           '-o', 'jsonpath={.items[0].metadata.uid}') == queue_uid
             print(f'PASS: Kind/Helm install, one instance/slot, all health/HTTP metrics, '
                   f'{count} committed/API records after full replay and drain, '
-                  '247 GPUs, ordered telemetry and inclusive filters.', flush=True)
+                  '247 GPUs, ordered telemetry and inclusive filters, '
+                  'Helm scale-to-zero and resume without queue restart.', flush=True)
         except Exception:
             if created and kubeconfig.exists():
                 for args in [('get', 'pods,pvc'), ('get', 'events', '--sort-by=.lastTimestamp')]:

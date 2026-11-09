@@ -20,6 +20,8 @@ type blockedStore struct {
 	err         error
 }
 
+func (s *blockedStore) Ready(ctx context.Context) error { return ctx.Err() }
+
 func (s *blockedStore) Insert(ctx context.Context, k telemetry.Key, _ telemetry.Record) (bool, error) {
 	n := s.active.Add(1)
 	defer s.active.Add(-1)

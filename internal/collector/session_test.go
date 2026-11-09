@@ -61,6 +61,8 @@ func (s *scriptedStream) Recv() (*pb.Delivery, error) {
 
 type storeFunc func(context.Context, telemetry.Key, telemetry.Record) (bool, error)
 
+func (f storeFunc) Ready(ctx context.Context) error { return ctx.Err() }
+
 func (f storeFunc) Insert(ctx context.Context, key telemetry.Key, record telemetry.Record) (bool, error) {
 	return f(ctx, key, record)
 }
@@ -312,7 +314,7 @@ func TestRunLogsOriginalReceiveFailure(t *testing.T) {
 	client := &scriptedClient{open: func(ctx context.Context) *scriptedStream {
 		return &scriptedStream{ctx: ctx, receive: func() (*pb.Delivery, error) { return nil, failure }}
 	}}
-	c := &Collector{Client: client, Slots: 1, ProcessTimeout: time.Second, SendTimeout: time.Second, Log: slog.New(slog.NewJSONHandler(logs, nil))}
+	c := &Collector{Client: client, Store: &blockedStore{}, Slots: 1, ProcessTimeout: time.Second, SendTimeout: time.Second, Log: slog.New(slog.NewJSONHandler(logs, nil))}
 	done := make(chan error, 1)
 	go func() { done <- c.Run(serviceCtx) }()
 	select {
@@ -413,7 +415,7 @@ func TestRunRejectsInvalidConfigurationOrIncompatibleBudget(t *testing.T) {
 	c = &Collector{Client: &scriptedClient{open: func(ctx context.Context) *scriptedStream {
 		calls++
 		return &scriptedStream{ctx: ctx, header: func() (metadata.MD, error) { return metadata.Pairs("ack-timeout", "2s"), nil }}
-	}}, Slots: 1, ProcessTimeout: time.Second, SendTimeout: time.Second}
+	}}, Store: &blockedStore{}, Slots: 1, ProcessTimeout: time.Second, SendTimeout: time.Second}
 	if err := c.Run(context.Background()); !errors.Is(err, ErrTimeoutConfiguration) || calls != 1 {
 		t.Fatal("configuration failure retried", err, calls)
 	}

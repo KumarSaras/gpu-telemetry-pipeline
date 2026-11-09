@@ -17,6 +17,8 @@ import (
 
 // Store persists one result per stable transport key.
 type Store interface {
+	// Ready checks that telemetry storage is available before subscribing.
+	Ready(context.Context) error
 	// Insert returns true for a newly committed row, or false when the key
 	// already exists. Duplicate keys preserve the original row without
 	// comparing payload content. An error must not be acknowledged as persisted.
@@ -48,13 +50,23 @@ func (c *Collector) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		err := c.session(ctx)
-		if errors.Is(err, ErrTimeoutConfiguration) {
-			return err
+		checkctx, cancel := context.WithTimeout(ctx, c.SendTimeout)
+		err := c.Store.Ready(checkctx)
+		cancel()
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		if ctx.Err() == nil {
-			c.Log.Warn("subscription reconnecting", "error", err)
-			c.Metrics.Add("collector_reconnects_total", 1)
+		if err != nil {
+			c.Log.Warn("waiting for telemetry storage", "error", err)
+		} else {
+			err = c.session(ctx)
+			if errors.Is(err, ErrTimeoutConfiguration) {
+				return err
+			}
+			if ctx.Err() == nil {
+				c.Log.Warn("subscription reconnecting", "error", err)
+				c.Metrics.Add("collector_reconnects_total", 1)
+			}
 		}
 		if err := platform.Pause(ctx, attempt); err != nil {
 			return err

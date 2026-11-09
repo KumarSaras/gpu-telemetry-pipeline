@@ -4,6 +4,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -24,6 +25,9 @@ type Pool interface {
 }
 
 type Repository struct{ Pool Pool }
+
+// ErrTableNotReady means telemetry storage is not yet visible to this connection.
+var ErrTableNotReady = errors.New("telemetry table is not available")
 
 func Open(ctx context.Context, url string, max int32) (*Repository, error) {
 	cfg, err := pgxpool.ParseConfig(url)
@@ -112,7 +116,15 @@ func (*empty) Err() error                        { return nil }
 func (*empty) Close()                            {}
 
 // Ready checks table availability and the service role's read permission, not just TCP reachability.
+// Missing storage is detected without querying an absent table during migration.
 func (r *Repository) Ready(ctx context.Context) error {
+	var exists bool
+	if err := r.Pool.QueryRow(ctx, "SELECT to_regclass('telemetry') IS NOT NULL").Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrTableNotReady
+	}
 	rows, err := r.Pool.Query(ctx, "SELECT uuid FROM telemetry LIMIT 0")
 	if err != nil {
 		return err

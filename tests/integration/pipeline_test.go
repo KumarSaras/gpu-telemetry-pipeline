@@ -6,11 +6,13 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	pb "gpu-telemetry-pipeline/api/queue/v1"
 	"gpu-telemetry-pipeline/internal/collector"
 	"gpu-telemetry-pipeline/internal/gateway"
+	"gpu-telemetry-pipeline/internal/observe"
 	"gpu-telemetry-pipeline/internal/streamer"
 	"gpu-telemetry-pipeline/internal/telemetry"
 	db "gpu-telemetry-pipeline/internal/telemetry/postgres"
@@ -19,6 +21,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -74,6 +77,70 @@ func databasePool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), "DROP SCHEMA "+identifier+" CASCADE"); pool.Close() })
 	return pool
+}
+
+type startupRepository struct {
+	*db.Repository
+	checked chan error
+	once    sync.Once
+}
+
+func (r *startupRepository) Ready(ctx context.Context) error {
+	err := r.Repository.Ready(ctx)
+	r.once.Do(func() { r.checked <- err })
+	return err
+}
+
+func TestCollectorWaitsForMigrationBeforeConsuming(t *testing.T) {
+	pool := databasePool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	repo := &startupRepository{Repository: &db.Repository{Pool: pool}, checked: make(chan error, 1)}
+	b, client := testsupport.Queue(t)
+	producer := &streamer.GRPCProducer{Client: client, Timeout: time.Second}
+	defer producer.Close()
+	key := telemetry.Key{Session: "0123456789abcdef0123456789abcdef", Sequence: 1}
+	message := telemetry.Envelope{Key: key, Telemetry: telemetry.Raw{Timestamp: "2026-10-30T10:00:00Z", UUID: "GPU-waiting", MetricName: "util", Value: "1.2300"}}
+	if err := producer.Send(ctx, message); err != nil {
+		t.Fatal(err)
+	}
+	metrics := observe.New()
+	worker := &collector.Collector{Client: client, Store: repo, Slots: 1, ProcessTimeout: time.Second, SendTimeout: time.Second, Log: testsupport.Logger(), Metrics: metrics}
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("collector did not stop")
+		}
+	}()
+	select {
+	case err := <-repo.checked:
+		if !errors.Is(err, db.ErrTableNotReady) {
+			t.Fatal("unmigrated database must return not-ready without a SQL failure", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("collector did not check storage", ctx.Err())
+	}
+	snapshot, err := b.Snapshot(ctx)
+	if err != nil || snapshot.Subscribers != 0 || snapshot.Ready != 1 || snapshot.InFlight != 0 || worker.Ready.Load() {
+		t.Fatal("collector consumed work before migration", snapshot, err)
+	}
+	if err := migrations.Apply(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	testsupport.Eventually(t, func() bool { s, _ := b.Snapshot(ctx); return s.Completed == 1 && worker.Ready.Load() })
+	var count int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM telemetry WHERE streamer_session=$1 AND sequence=$2", key.Session, key.Sequence).Scan(&count); err != nil || count != 1 {
+		t.Fatal("queued record not persisted after migration", count, err)
+	}
+	w := httptest.NewRecorder()
+	metrics.ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
+	if strings.Contains(w.Body.String(), "collector_commit_errors_total") || strings.Contains(w.Body.String(), "collector_reconnects_total") {
+		t.Fatal("schema wait was counted as a failed commit or reconnect", w.Body.String())
+	}
 }
 
 func TestInitialMigrationPreservesTelemetryOnReapply(t *testing.T) {

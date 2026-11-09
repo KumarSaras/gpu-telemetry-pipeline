@@ -35,9 +35,28 @@ message_limit = render('--set', 'queue.maxMessageBytes=131072')
 assert message_limit.count('name: MAX_MESSAGE_BYTES, value: "131072"') == 3
 assert len(re.findall(r'^kind: Deployment$', plain, re.M)) == 4
 assert len(re.findall(r'^kind: StatefulSet$', plain, re.M)) == 1
+def deployment_replicas(manifest):
+    return {re.search(r'^  name: (\S+)$', document, re.M).group(1):
+            int(re.search(r'^  replicas: (\d+)$', document, re.M).group(1))
+            for document in manifest.split('---')
+            if re.search(r'^kind: Deployment$', document, re.M)}
+
+assert deployment_replicas(plain) == {
+    f'check-{name}': 1 for name in ('queue', 'gateway', 'collector', 'streamer')}
+for collector, streamer in ((0, 1), (1, 0), (0, 0), (10, 10)):
+    scaled = render('--set', f'collector.replicas={collector}',
+                    '--set', f'streamer.replicas={streamer}')
+    assert deployment_replicas(scaled) == {
+        'check-queue': 1, 'check-gateway': 1,
+        'check-collector': collector, 'check-streamer': streamer}
+for service in ('collector', 'streamer'):
+    for invalid in ('-1', '11', '1.5'):
+        render('--set', f'{service}.replicas={invalid}', succeeds=False)
+
 slots = render('--set', 'collector.slots=4')
 assert 'name: COLLECTOR_SLOTS, value: "4"' in slots
 render('--set', 'queue.replicas=2', succeeds=False)
+render('--set', 'queue.replicas=0', succeeds=False)
 render('--set', 'collector.slots=129', succeeds=False)
 render('--set', 'database.postgresEnabled=false', succeeds=False)
 render('--set', 'security.insecureTransport=true', succeeds=False)
@@ -46,4 +65,4 @@ external = render('--set', 'database.postgresEnabled=false', '--set-string',
                   'database.url=postgres://postgres@external:5432/telemetry?sslmode=disable')
 assert 'kind: StatefulSet' not in external
 assert external.count('postgres://postgres@external:5432/telemetry?sslmode=disable') == 3
-print('PASS: password-free chart, one instance defaults, configured slots, external database URL, no TLS/Secret flows, invalid values rejected.')
+print('PASS: password-free chart, one instance defaults, worker replicas 0–10, configured slots, external database URL, no TLS/Secret flows, invalid values rejected.')
