@@ -18,7 +18,7 @@ Helm also runs a one-time migration Job to prepare the database schema. A queue 
 
 ## Deploy locally with Kind and Helm
 
-Install **Docker, Make, Kind, kubectl, Helm, curl, and Python 3**. Start Docker and check that `docker info` succeeds. Go is not needed to build the application images; Docker compiles them.
+Install **Docker, Make, Kind, kubectl, Helm, curl, and Python 3.9 or newer**. Start Docker and check that `docker info` succeeds. Go is not needed to build the application images; Docker compiles them. Ripgrep is not required.
 
 These steps create a fresh local installation. Run commands from the cloned repository.
 
@@ -324,7 +324,7 @@ kubectl -n gpu-telemetry get events --sort-by=.lastTimestamp
 
 ## Tests and Make commands
 
-Host-side Go commands require **Go 1.26.4 or newer**. Coverage checks and the smoke runner also require Python 3.
+Host-side Go commands require **Go 1.26.4 or newer**. Coverage checks and the smoke runner also require Python 3.9 or newer; macOS’s Python 3.9 is supported. Select another interpreter with `PYTHON=/path/to/python3` when invoking Make.
 
 ```sh
 make test-race
@@ -337,7 +337,7 @@ make coverage
 | `make test` | Run Go unit and transport tests; no database or Kubernetes required. |
 | `make test-race` | Run those tests with Go's race detector. |
 | `make vet` | Run Go static checks. |
-| `make coverage` | Run unit coverage, generate text/HTML reports at `coverage.html`, test the coverage gate, and enforce the above-90% total. |
+| `make coverage` | Run unit coverage, generate text/HTML reports at `coverage.html`, check tooling/coverage regressions, and enforce the above-90% total. |
 | `make images` | Build the five local service/migration images using Docker. Does not publish them. |
 | `make helm-lint` | Validate the Helm chart. |
 | `make helm-template` | Render Kubernetes manifests to `.cache/helm-rendered.yaml` without installing them. |
@@ -384,3 +384,10 @@ To remove the entire local Kind cluster **and its database data**:
 ```sh
 kind delete cluster --name gpu-telemetry --kubeconfig "$KUBECONFIG"
 ```
+
+## AI assistance
+
+AI was used during design, implementation, testing, and documentation.
+The [AI prompt and review record](docs/ai-prompts-info.md) contains the
+prompts used, where responses fell short, and the human decisions and
+follow-up work that shaped the solution.

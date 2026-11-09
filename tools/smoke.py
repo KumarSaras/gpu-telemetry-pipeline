@@ -21,6 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVICES = ('queue', 'streamer', 'collector', 'gateway', 'migrate')
 
 
+def parse_timestamp(value):
+    # PostgreSQL timestamps have at most six fractional digits; Go omits
+    # trailing zeros. strptime accepts every length on Python 3.9 as well.
+    pattern = '%Y-%m-%dT%H:%M:%S.%f%z' if '.' in value else '%Y-%m-%dT%H:%M:%S%z'
+    return datetime.strptime(value, pattern)
+
+
 def main():
     executables = {name: os.environ.get(name.upper(), name)
                    for name in ('kind', 'kubectl', 'helm', 'docker')}
@@ -178,8 +185,7 @@ def main():
                 path = '/api/v1/gpus/' + urllib.parse.quote(gpu, safe='') + '/telemetry'
                 rows = json.loads(text(gateway, path))
                 assert len(rows) >= 10 and all(row['uuid'] == gpu for row in rows)
-                timestamps = [datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
-                              for row in rows]
+                timestamps = [parse_timestamp(row['timestamp']) for row in rows]
                 assert timestamps == sorted(timestamps)
                 total += len(rows)
                 if first is None:

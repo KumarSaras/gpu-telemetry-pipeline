@@ -9,7 +9,7 @@ KUBECTL ?= $(if $(wildcard $(ROOT)/.cache/tools/kubectl),$(ROOT)/.cache/tools/ku
 PROTOC ?= $(if $(wildcard $(ROOT)/.cache/tools/protoc/bin/protoc),$(ROOT)/.cache/tools/protoc/bin/protoc,protoc)
 IMAGE_PREFIX ?= gpu-telemetry
 IMAGE_TAG ?= dev
-COVER_PKGS = $(shell GOMODCACHE="$(ROOT)/.cache/gomod" GOCACHE="$(ROOT)/.cache/gobuild" go list ./internal/... ./migrations/... | rg -v '/testsupport$$' | paste -sd, -)
+PYTHON ?= python3
 
 .PHONY: build test test-race coverage vet openapi generate-proto integration images helm-lint helm-template migrate
 build:
@@ -22,11 +22,16 @@ test-race:
 vet:
 	go vet ./...
 coverage:
-	go test -coverpkg=$(COVER_PKGS) -coverprofile=coverage.out -covermode=atomic ./internal/... ./migrations/...
+	@set -eu; \
+	packages=$$(go list ./internal/... ./migrations/...); \
+	cover_pkgs=$$(printf '%s\n' "$$packages" | sed '\|/testsupport$$|d' | paste -sd, -); \
+	if [ -z "$$cover_pkgs" ]; then echo "No coverage packages found." >&2; exit 1; fi; \
+	go test -coverpkg="$$cover_pkgs" -coverprofile=coverage.out -covermode=atomic ./internal/... ./migrations/...
 	go tool cover -func=coverage.out
 	go tool cover -html=coverage.out -o coverage.html
-	python3 -B tests/test_coverage_gate.py
-	python3 tools/check_coverage.py coverage.out
+	$(PYTHON) -B tests/test_coverage_gate.py
+	$(PYTHON) -B tests/test_tooling.py
+	$(PYTHON) tools/check_coverage.py coverage.out
 openapi:
 	@mkdir -p api
 	@go run ./cmd/openapi > api/openapi.json.tmp && mv api/openapi.json.tmp api/openapi.json
@@ -46,8 +51,8 @@ migrate:
 
 .PHONY: smoke
 smoke:
-	HELM="$(HELM)" KIND="$(KIND)" KUBECTL="$(KUBECTL)" IMAGE_PREFIX="$(IMAGE_PREFIX)" IMAGE_TAG="$(IMAGE_TAG)" python3 tools/smoke.py
+	HELM="$(HELM)" KIND="$(KIND)" KUBECTL="$(KUBECTL)" IMAGE_PREFIX="$(IMAGE_PREFIX)" IMAGE_TAG="$(IMAGE_TAG)" $(PYTHON) tools/smoke.py
 
 .PHONY: helm-check
 helm-check:
-	HELM="$(HELM)" python3 tools/check_chart.py
+	HELM="$(HELM)" $(PYTHON) tools/check_chart.py
