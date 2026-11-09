@@ -13,7 +13,6 @@ CREATE TABLE telemetry (
     pod text NOT NULL,
     namespace text NOT NULL,
     labels_raw text NOT NULL,
-    payload_hash bytea NOT NULL CHECK (octet_length(payload_hash) = 32),
     PRIMARY KEY (streamer_session, sequence)
 );
 CREATE INDEX telemetry_uuid_timestamp_idx ON telemetry (uuid, timestamp);

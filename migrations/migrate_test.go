@@ -60,15 +60,14 @@ func poolFor(tx *transaction) Beginner {
 	return beginnerFunc(func(context.Context) (pgx.Tx, error) { return tx, nil })
 }
 
-func TestApplyOrdersMissingVersionsAndSkipsAppliedVersions(t *testing.T) {
+func TestApplyInitialSchemaAndSkipsAppliedVersion(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		applied map[int]bool
 		want    []int
 	}{
-		{"fresh", nil, []int{1, 2}},
-		{"upgrade", map[int]bool{1: true}, []int{2}},
-		{"already current", map[int]bool{1: true, 2: true}, nil},
+		{"fresh", nil, []int{1}},
+		{"already current", map[int]bool{1: true}, nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tx := &transaction{applied: test.applied}
@@ -93,9 +92,6 @@ func TestApplyOrdersMissingVersionsAndSkipsAppliedVersions(t *testing.T) {
 				if test.applied[1] && sql == initial {
 					t.Fatal("reapplied initial schema")
 				}
-				if test.applied[2] && sql == dropPayloadHash {
-					t.Fatal("reapplied completed migration")
-				}
 			}
 		})
 	}
@@ -103,12 +99,12 @@ func TestApplyOrdersMissingVersionsAndSkipsAppliedVersions(t *testing.T) {
 
 func TestApplyRollsBackEveryFailedStatementOrVersionRead(t *testing.T) {
 	failure := errors.New("database statement failed")
-	for operation := 1; operation <= 8; operation++ {
+	for operation := 1; operation <= 5; operation++ {
 		tx := &transaction{failure: failure}
-		if operation <= 6 {
+		if operation <= 4 {
 			tx.failExec = operation
 		} else {
-			tx.failQuery = operation - 6
+			tx.failQuery = operation - 4
 		}
 		if err := Apply(context.Background(), poolFor(tx)); !errors.Is(err, failure) {
 			t.Fatalf("operation %d: %v", operation, err)

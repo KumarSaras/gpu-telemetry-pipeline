@@ -79,7 +79,7 @@ func TestInsertUsesStableKeyAndPreservesAllRecordFields(t *testing.T) {
 		calls := 0
 		repo := &Repository{Pool: &fakePool{exec: func(got context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 			calls++
-			if got != ctx || !strings.Contains(sql, "ON CONFLICT(streamer_session,sequence) DO NOTHING") || strings.Contains(sql, "payload_hash") {
+			if got != ctx || !strings.Contains(sql, "ON CONFLICT(streamer_session,sequence) DO NOTHING") {
 				t.Fatal(sql)
 			}
 			want := []any{k.Session, k.Sequence, r.Timestamp, r.UUID, r.MetricName, string(r.Value), r.GPUID, r.Device, r.ModelName, r.Hostname, r.Container, r.Pod, r.Namespace, r.LabelsRaw}

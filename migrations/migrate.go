@@ -11,9 +11,6 @@ import (
 //go:embed 001_telemetry.sql
 var initial string
 
-//go:embed 002_drop_payload_hash.sql
-var dropPayloadHash string
-
 // Beginner is the transaction boundary supplied by *pgxpool.Pool.
 type Beginner interface {
 	Begin(context.Context) (pgx.Tx, error)
@@ -38,7 +35,7 @@ func Apply(ctx context.Context, pool Beginner) error {
 	for _, migration := range []struct {
 		version int
 		sql     string
-	}{{1, initial}, {2, dropPayloadHash}} {
+	}{{1, initial}} {
 		var exists bool
 		if err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)", migration.version).Scan(&exists); err != nil {
 			return err

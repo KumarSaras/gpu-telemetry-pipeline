@@ -35,10 +35,6 @@ func database(t *testing.T) *db.Repository {
 	if e := migrations.Apply(ctx, pool); e != nil {
 		t.Fatal("migration not repeatable", e)
 	}
-	var hashColumns int
-	if e := pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='telemetry' AND column_name='payload_hash'").Scan(&hashColumns); e != nil || hashColumns != 0 {
-		t.Fatal("payload_hash column remains", hashColumns, e)
-	}
 	return &db.Repository{Pool: pool}
 }
 
@@ -80,39 +76,30 @@ func databasePool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-func TestMigrationDropsPayloadHashPreservingTelemetry(t *testing.T) {
-	pool := databasePool(t)
+func TestInitialMigrationPreservesTelemetryOnReapply(t *testing.T) {
+	repo := database(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	legacy, err := os.ReadFile("../../migrations/001_telemetry.sql")
+	record, err := telemetry.Parse(telemetry.Raw{
+		Timestamp: "2026-10-30T10:00:00Z", UUID: "GPU-existing", MetricName: "util",
+		Value: "1.2300", GPUID: "0", Device: "nvidia0", ModelName: "test-model", Hostname: "host-a",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = pool.Exec(ctx, string(legacy)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = pool.Exec(ctx, "CREATE TABLE schema_migrations(version integer PRIMARY KEY); INSERT INTO schema_migrations VALUES (1)"); err != nil {
-		t.Fatal(err)
-	}
 	key := telemetry.Key{Session: "0123456789abcdef0123456789abcdef", Sequence: 1}
-	if _, err = pool.Exec(ctx, `INSERT INTO telemetry
-		(streamer_session,sequence,timestamp,uuid,metric_name,value,gpu_id,device,model_name,hostname,container,pod,namespace,labels_raw,payload_hash)
-		VALUES($1,$2,'2026-10-30T10:00:00Z','GPU-existing','util',1.2300,'0','nvidia0','test-model','host-a','','','','',decode(repeat('00',32),'hex'))`, key.Session, key.Sequence); err != nil {
-		t.Fatal(err)
+	if inserted, err := repo.Insert(ctx, key, record); err != nil || !inserted {
+		t.Fatal("initial insert failed", inserted, err)
 	}
 	for range 2 {
-		if err = migrations.Apply(ctx, pool); err != nil {
+		if err := migrations.Apply(ctx, repo.Pool); err != nil {
 			t.Fatal(err)
 		}
 	}
-	var hashColumns, versions int
-	if err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='telemetry' AND column_name='payload_hash'").Scan(&hashColumns); err != nil || hashColumns != 0 {
-		t.Fatal("payload_hash column remains", hashColumns, err)
+	var versions, version int
+	if err := repo.Pool.QueryRow(ctx, "SELECT count(*), max(version) FROM schema_migrations").Scan(&versions, &version); err != nil || versions != 1 || version != 1 {
+		t.Fatal("unexpected migration versions", versions, version, err)
 	}
-	if err = pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations WHERE version IN (1,2)").Scan(&versions); err != nil || versions != 2 {
-		t.Fatal("missing migration versions", versions, err)
-	}
-	repo := &db.Repository{Pool: pool}
 	rows, err := repo.Query(ctx, "GPU-existing", telemetry.Bounds{})
 	if err != nil {
 		t.Fatal(err)
@@ -121,9 +108,9 @@ func TestMigrationDropsPayloadHashPreservingTelemetry(t *testing.T) {
 	if !rows.Next() {
 		t.Fatal("existing telemetry lost", rows.Err())
 	}
-	record, err := rows.Record()
-	if err != nil || record.UUID != "GPU-existing" || string(record.Value) != "1.2300" || record.Timestamp.Format(time.RFC3339) != "2026-10-30T10:00:00Z" || record.Hostname != "host-a" {
-		t.Fatal("existing telemetry changed", record, err)
+	stored, err := rows.Record()
+	if err != nil || stored.UUID != record.UUID || string(stored.Value) != "1.2300" || !stored.Timestamp.Equal(record.Timestamp) || stored.Hostname != record.Hostname {
+		t.Fatal("existing telemetry changed", stored, err)
 	}
 	if rows.Next() || rows.Err() != nil {
 		t.Fatal("unexpected additional telemetry", rows.Err())
@@ -133,7 +120,7 @@ func TestMigrationDropsPayloadHashPreservingTelemetry(t *testing.T) {
 	}
 	key.Sequence++
 	if inserted, err := repo.Insert(ctx, key, record); err != nil || !inserted {
-		t.Fatal("insert without payload_hash failed", inserted, err)
+		t.Fatal("new key insert failed", inserted, err)
 	}
 }
 
@@ -306,7 +293,7 @@ func TestFailedMigrationRollsBackMetadataAndCanBeRetried(t *testing.T) {
 		t.Fatal("migration could not retry", err)
 	}
 	var versions int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 2 {
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 1 {
 		t.Fatal(versions, err)
 	}
 }
@@ -326,11 +313,8 @@ func TestConcurrentMigrationsSerializeAndApplyEachVersionOnce(t *testing.T) {
 		}()
 	}
 	workers.Wait()
-	var versions, legacyColumns int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 2 {
+	var versions int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 1 {
 		t.Fatal(versions, err)
-	}
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='telemetry' AND column_name='payload_hash'").Scan(&legacyColumns); err != nil || legacyColumns != 0 {
-		t.Fatal(legacyColumns, err)
 	}
 }
